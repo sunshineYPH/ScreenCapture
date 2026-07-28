@@ -1,0 +1,2 @@
+# ScreenCapture
+Screencapture for Ubuntu
