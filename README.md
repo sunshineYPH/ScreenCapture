@@ -14,6 +14,10 @@
 - 贴图窗口：可拖动、可关闭的浮动图片窗口
 - 截图自动保存到 `~/Pictures/Screenshots/YYYYMMDD_hhmmss.png`
 
+## 用法示例
+
+![Illustration](./illustration/illustration.png)
+
 ## 构建
 
 ```bash
@@ -48,6 +52,10 @@ Ubuntu 上 Setting -> Keyboard -> Shortcuts -> Custom -> + -> `Shift+Alt+S`
 # English Version
 
 A lightweight X11 screenshot tool, pure C++17 with no external image library dependencies (besides system X11 / zlib).
+
+## Illustration
+
+![Illustration](./illustration/illustration.png)
 
 ## Features
 
