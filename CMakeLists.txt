@@ -8,18 +8,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(X11 REQUIRED)
 include_directories(${X11_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/src)
 
-# Try to find FreeType
-set(FREETYPE_INCLUDE_DIRS "/usr/include/freetype2")
-set(FREETYPE_LIBRARIES "")
-find_library(FREETYPE_LIB freetype)
-if(FREETYPE_LIB)
-    set(FREETYPE_LIBRARIES ${FREETYPE_LIB})
-    message(STATUS "Found FreeType: ${FREETYPE_LIB}")
+# Find libpng for PNG icon decoding (libpng16 is on every Linux desktop).
+# The project also has a hand-rolled PNG encoder in png_io.cpp; libpng
+# is only used to *read* the small menu-icon assets.
+find_path(PNG_INCLUDE_DIRS png.h)
+find_library(PNG_LIBRARIES png)
+if(PNG_INCLUDE_DIRS AND PNG_LIBRARIES)
+    message(STATUS "Found libpng: ${PNG_LIBRARIES}")
 else()
-    message(WARNING "FreeType not found, text rendering may be limited")
+    message(WARNING "libpng not found; menu icons will be unavailable")
 endif()
 
-add_executable(screen_capture
+add_executable(${PROJECT_NAME}
     src/main.cpp
     src/capture.cpp
     src/renderer.cpp
@@ -27,17 +27,22 @@ add_executable(screen_capture
     src/clipboard.cpp
     src/pin_window.cpp
     src/ui_helpers.cpp
+    src/button_icons.cpp
 )
 
-target_link_libraries(screen_capture
+target_link_libraries(${PROJECT_NAME}
     ${X11_LIBRARIES}
-    #${FREETYPE_LIBRARIES}
-    /lib/x86_64-linux-gnu/libfreetype.so.6
+    Xrender
+    ${PNG_LIBRARIES}
     z
 )
 
-if(FREETYPE_LIB)
-    target_include_directories(screen_capture PRIVATE ${FREETYPE_INCLUDE_DIRS})
+if(PNG_INCLUDE_DIRS)
+    target_include_directories(${PROJECT_NAME} PRIVATE ${PNG_INCLUDE_DIRS})
 endif()
 
-target_compile_options(screen_capture PRIVATE -Wall -Wextra)
+target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra)
+
+set(INSTALL_DIR ${CMAKE_SOURCE_DIR}/install)
+install(DIRECTORY assets DESTINATION ${INSTALL_DIR})
+install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION ${INSTALL_DIR})

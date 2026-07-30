@@ -119,3 +119,89 @@ std::vector<unsigned char> encodePNG(XImage* img, int width, int height) {
 
     return png;
 }
+
+// ---------- PNG decoder (libpng) ----------
+//
+// The hand-rolled encoder above is fine for the project's main path
+// (writing the screenshot). But reading PNG icon assets is a different
+// problem — we need to handle all 8-bit color types (gray, gray+alpha,
+// RGB, RGBA, palette) and the 5 PNG filter modes. Re-deriving all of
+// that would be hundreds of lines and easy to break on interlaced or
+// 16-bit files. libpng is on every Linux desktop, so we use it for
+// reading only.
+
+#include <png.h>
+#include <cstdio>
+#include <cstdlib>
+
+DecodedPNG decodePNGFile(const std::string& path) {
+    DecodedPNG out;
+
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) return out;
+
+    png_structp png = png_create_read_struct(
+        PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+    if (!png) { std::fclose(fp); return out; }
+
+    png_infop info = png_create_info_struct(png);
+    if (!info) {
+        png_destroy_read_struct(&png, nullptr, nullptr);
+        std::fclose(fp);
+        return out;
+    }
+
+    // libpng's longjmp-on-error requires this setup. We use it to
+    // return cleanly instead of unwinding through C++ destructors.
+    if (setjmp(png_jmpbuf(png))) {
+        png_destroy_read_struct(&png, &info, nullptr);
+        std::fclose(fp);
+        return out;
+    }
+
+    png_init_io(png, fp);
+    png_read_info(png, info);
+
+    int w = static_cast<int>(png_get_image_width(png, info));
+    int h = static_cast<int>(png_get_image_height(png, info));
+    png_byte color_type = png_get_color_type(png, info);
+    png_byte bit_depth  = png_get_bit_depth(png, info);
+
+    // Normalize the format to 8-bit RGBA so the rest of the pipeline
+    // can assume a single layout. Handles palette images, 16-bit
+    // channels, and grayscale/gray-alpha sources.
+    if (bit_depth == 16) png_set_strip_16(png);
+    if (color_type == PNG_COLOR_TYPE_PALETTE) png_set_palette_to_rgb(png);
+    if (color_type == PNG_COLOR_TYPE_GRAY && bit_depth < 8) {
+        png_set_expand_gray_1_2_4_to_8(png);
+    }
+    if (png_get_valid(png, info, PNG_INFO_tRNS)) png_set_tRNS_to_alpha(png);
+    if (color_type == PNG_COLOR_TYPE_RGB ||
+        color_type == PNG_COLOR_TYPE_GRAY ||
+        color_type == PNG_COLOR_TYPE_PALETTE) {
+        png_set_filler(png, 0xFF, PNG_FILLER_AFTER);
+    }
+    if (color_type == PNG_COLOR_TYPE_GRAY ||
+        color_type == PNG_COLOR_TYPE_GRAY_ALPHA) {
+        png_set_gray_to_rgb(png);
+    }
+
+    png_read_update_info(png, info);
+
+    out.width = w;
+    out.height = h;
+    out.rgba.assign(static_cast<size_t>(w) * h * 4, 0);
+
+    // libpng wants row pointers into caller-owned memory. We supply
+    // pointers into the output vector; the bytes-per-row must match
+    // what we told libpng in update_info (RGBA = w*4).
+    std::vector<png_bytep> rows(h);
+    for (int y = 0; y < h; y++) {
+        rows[y] = out.rgba.data() + static_cast<size_t>(y) * w * 4;
+    }
+    png_read_image(png, rows.data());
+
+    png_destroy_read_struct(&png, &info, nullptr);
+    std::fclose(fp);
+    return out;
+}

@@ -1,4 +1,5 @@
 #include "renderer.h"
+#include "button_icons.h"
 #include <X11/Xutil.h>
 #include <cmath>
 #include <cstring>
@@ -38,6 +39,7 @@ Renderer::Renderer(Display* display, Window window, ScreenCapture* capture)
     , m_winGC(nullptr)
     , m_font(nullptr)
     , m_fontLoaded(false)
+    , m_submenuFont(nullptr)
     , m_fontset(nullptr)
     , m_fontsetLoaded(false)
     , m_selX(0), m_selY(0), m_selWidth(0), m_selHeight(0)
@@ -66,6 +68,27 @@ Renderer::Renderer(Display* display, Window window, ScreenCapture* capture)
         m_colorSubMenu.colors.push_back({AVAILABLE_COLORS[i].name, AVAILABLE_COLORS[i]});
     }
 
+    m_sizeSubMenu.visible = false;
+    m_sizeSubMenu.hoveredIndex = -1;
+    m_sizeSubMenu.itemHeight = 30;
+    // Wider than the text needs because the rows now also
+    // show a 10x10 radio button on the left, with 8px of
+    // padding on each side of the dot, and 8px of padding
+    // after the dot before the label. 110 is enough for
+    // "medium" + 24px dot + padding.
+    m_sizeSubMenu.itemWidth = 110;
+    // Three preset sizes — small/medium/big. Display label
+    // intentionally omits the "pt" suffix; the user picks the
+    // size by name only, and the actual font size is set on
+    // the renderer.
+    m_sizeSubMenu.sizes.push_back({"small",  16});
+    m_sizeSubMenu.sizes.push_back({"medium", 24});
+    m_sizeSubMenu.sizes.push_back({"big",    32});
+
+    // Load the default size's font. setFontSize also handles
+    // 16 -> 9x15, 24 -> 12x24, 32 -> 16x32 mapping.
+    setFontSize(m_fontSize);
+
     saveHistory();
 }
 
@@ -75,7 +98,68 @@ Renderer::~Renderer() {
     if (m_winGC) XFreeGC(m_display, m_winGC);
     if (m_buffer != None) XFreePixmap(m_display, m_buffer);
     if (m_dimmedImage) XDestroyImage(m_dimmedImage);
-    if (m_font) XFreeFont(m_display, m_font);
+    // Note: m_font points into m_fontsBySize for the current
+    // size, so XFreeFont on it would double-free. We free
+    // the cache first, then null the active pointer to
+    // prevent the (now stale) free below.
+    for (auto& kv : m_fontsBySize) {
+        if (kv.second) XFreeFont(m_display, kv.second);
+    }
+    m_fontsBySize.clear();
+    m_font = nullptr;
+    if (m_submenuFont) XFreeFont(m_display, m_submenuFont);
+    if (m_fontset) XFreeFontSet(m_display, m_fontset);
+}
+
+void Renderer::ensureFallbackFont() {
+    // The active bitmap font (m_font) is now managed by
+    // getFontForSize / setFontSize, which cache every
+    // requested size. This function is kept for any caller
+    // that still wants a guaranteed non-null m_font; it
+    // simply triggers a load at the current size.
+    if (m_fontLoaded && m_font) return;
+    m_font = getFontForSize(m_fontSize);
+    m_fontLoaded = (m_font != nullptr);
+}
+
+XFontStruct* Renderer::getFontForSize(int size) {
+    // Fast path — already cached.
+    auto it = m_fontsBySize.find(size);
+    if (it != m_fontsBySize.end()) return it->second;
+
+    // Map requested pixel size to an X core bitmap font
+    // that actually exists on this system. The pcf.gz files
+    // under /usr/share/fonts/X11/misc/ on a typical Linux
+    // desktop are: 4x6, 5x7, 5x8, 6x9..6x13, 7x13..7x14,
+    // 8x13..8x16, 9x15, 9x18, 10x20, 12x24. Anything else
+    // (16x32, 18x18) is aliased to 6x13 by the X server and
+    // is therefore useless for size selection.
+    const char* fontName = "9x15";  // 15px — small default
+    if (size >= 20 && size < 30) fontName = "10x20";  // 20px — medium
+    else if (size >= 30)         fontName = "12x24";  // 24px — big
+    XFontStruct* f = XLoadQueryFont(m_display, fontName);
+    if (!f) {
+        // Minimal systems might be missing 10x20 or 12x24.
+        // Step down through the available sizes until one
+        // loads.
+        const char* fallbacks[] = {"10x20", "9x15", "fixed"};
+        for (const char* fb : fallbacks) {
+            f = XLoadQueryFont(m_display, fb);
+            if (f) break;
+        }
+    }
+    if (f) m_fontsBySize[size] = f;
+    return f;
+}
+
+XFontStruct* Renderer::getSubmenuFont() {
+    if (m_submenuFont) return m_submenuFont;
+    // Always 9x15 — small, fixed, and unaffected by the
+    // user's size choice. Submenu labels are metadata, not
+    // content the user is composing.
+    m_submenuFont = XLoadQueryFont(m_display, "9x15");
+    if (!m_submenuFont) m_submenuFont = XLoadQueryFont(m_display, "fixed");
+    return m_submenuFont;
 }
 
 void Renderer::initDoubleBuffer() {
@@ -138,6 +222,11 @@ void Renderer::updateColorSubMenu(int baseX, int baseY) {
     m_colorSubMenu.y = baseY;
 }
 
+void Renderer::updateSizeSubMenu(int baseX, int baseY) {
+    m_sizeSubMenu.x = baseX;
+    m_sizeSubMenu.y = baseY;
+}
+
 void Renderer::render() {
     if (m_bufferGC == nullptr) {
         m_bufferGC = XCreateGC(m_display, m_buffer, 0, nullptr);
@@ -171,6 +260,9 @@ void Renderer::render() {
 
     if (m_colorSubMenu.visible) {
         drawColorSubMenuToBuffer(m_bufferGC);
+    }
+    if (m_sizeSubMenu.visible) {
+        drawSizeSubMenuToBuffer(m_bufferGC);
     }
 
     drawArrowsToBuffer(m_bufferGC, m_arrows);
@@ -217,7 +309,7 @@ void Renderer::renderToPixmap(Pixmap pixmap, int selX, int selY, int selW, int s
     for (const auto& text : m_texts) {
         int tx = text.x - selX;
         int ty = text.y - selY;
-        drawTextString(pixmap, gc, tx, ty, text.text, text.color);
+        drawTextString(pixmap, gc, tx, ty, text.text, text.color, text.fontSize);
     }
 
     XFreeGC(m_display, gc);
@@ -305,9 +397,11 @@ void Renderer::drawMenuBarToBuffer(GC gc) {
 
     int totalWidth = 0;
     const int btnSpacing = 4;
-    const int btnHeight = 26;
     const int barPadH = 10;
-    const int barPadV = 4;
+    // Thin top/bottom padding (was 6) — the bar hugs the
+    // buttons so it reads as a flat toolbar strip instead of
+    // a chunky block with internal padding.
+    const int barPadV = 0;
 
     for (const auto& btn : m_menuButtons) {
         totalWidth += btn.width + btnSpacing;
@@ -316,39 +410,77 @@ void Renderer::drawMenuBarToBuffer(GC gc) {
     int barX = m_menuButtons[0].x - barPadH;
     int barY = m_menuButtons[0].y - barPadV;
     int barWidth = totalWidth + barPadH * 2;
-    int barHeight = btnHeight + barPadV * 2;
+    int barHeight = m_menuButtons[0].height + barPadV * 2;
 
-    setGCColor(m_display, gc, 45, 45, 45);
+    // Bar background: pure white. The screenshot selection
+    // window overlays whatever is on the screen — a white bar
+    // reads as a clean "tool palette" floating above the
+    // capture.
+    setGCColor(m_display, gc, 255, 255, 255);
     XFillRectangle(m_display, m_buffer, gc, barX, barY, barWidth, barHeight);
 
-    setGCColor(m_display, gc, 70, 70, 70);
-    XDrawRectangle(m_display, m_buffer, gc, barX, barY, barWidth, barHeight);
+    // (Bar border removed — flat modern look.)
 
-    if (!m_fontLoaded) {
-        m_font = XLoadQueryFont(m_display, "9x15");
-        m_fontLoaded = true;
-    }
-    if (m_font) {
-        for (const auto& btn : m_menuButtons) {
-            if (btn.pressed) {
-                setGCColor(m_display, gc, 100, 100, 100);
-            } else if (btn.hovered) {
-                setGCColor(m_display, gc, 65, 65, 65);
-            } else {
-                setGCColor(m_display, gc, 55, 55, 55);
-            }
-            XFillRectangle(m_display, m_buffer, gc, btn.x, btn.y, btn.width, btn.height);
-
-            setGCColor(m_display, gc, 90, 90, 90);
-            XDrawRectangle(m_display, m_buffer, gc, btn.x, btn.y, btn.width, btn.height);
-
+    // Each button has its own hover/press state. The button face
+    // is filled with the state color, then the PNG icon is
+    // composited on top via XRender. Hovering also brightens the
+    // icon itself with a white alpha overlay so the user gets a
+    // clear "this is the active button" cue.
+    for (const auto& btn : m_menuButtons) {
+        // Pick the button's fill color based on hover/press
+        // state. The bar background is white (255,255,255), and
+        // the unhovered button face is the same white — that
+        // way the buttons are visually flat in their resting
+        // state, indistinguishable from the bar background
+        // until the user mouses over them. Hover/press then
+        // darkens the button (light gray) to provide the
+        // affordance. Going dark on hover is the inverse of the
+        // dark-bar scheme but works correctly on a white
+        // background.
+        if (btn.pressed) {
+            setGCColor(m_display, gc, 200, 200, 200);
+        } else if (btn.hovered) {
+            setGCColor(m_display, gc, 230, 230, 230);
+        } else {
             setGCColor(m_display, gc, 255, 255, 255);
-            XSetFont(m_display, gc, m_font->fid);
-            int textWidth = XTextWidth(m_font, btn.label.c_str(), (int)btn.label.length());
-            int textX = btn.x + (btn.width - textWidth) / 2;
-            int textY = btn.y + (btn.height + m_font->ascent - m_font->descent) / 2;
-            XDrawString(m_display, m_buffer, gc, textX, textY,
-                        btn.label.c_str(), (int)btn.label.length());
+        }
+        XFillRectangle(m_display, m_buffer, gc, btn.x, btn.y, btn.width, btn.height);
+
+        // Draw the PNG icon for this button using XRender's
+        // alpha-blended composite. The button's gray face is
+        // already filled above, so a transparent icon background
+        // blends with the gray and only the figure's pixels
+        // contribute new color.
+        Pixmap icon;
+        int iw = 0, ih = 0;
+        if (button_icons::get(btn.label, &icon, &iw, &ih)) {
+            int ix = btn.x + (btn.width - iw) / 2;
+            int iy = btn.y + (btn.height - ih) / 2;
+            button_icons::drawIcon(m_display, m_buffer, gc, icon, ix, iy, iw, ih);
+            // Hover/press highlight: paint a white overlay over
+            // the icon at low alpha. The overlay only affects
+            // the icon's figure pixels (where the source had
+            // alpha > 0), so the surrounding button face stays
+            // its normal color. This gives a clear, obvious
+            // "active" state without changing the icon's shape
+            // or underlying color identity.
+            if (btn.hovered || btn.pressed) {
+                button_icons::drawIconHighlight(m_display, m_buffer,
+                                                 icon, ix, iy, iw, ih,
+                                                 255, 255, 255,
+                                                 btn.pressed ? 90 : 60);
+            }
+        } else {
+            ensureFallbackFont();
+            if (m_font) {
+                setGCColor(m_display, gc, 255, 255, 255);
+                XSetFont(m_display, gc, m_font->fid);
+                int textWidth = XTextWidth(m_font, btn.label.c_str(), (int)btn.label.length());
+                int textX = btn.x + (btn.width - textWidth) / 2;
+                int textY = btn.y + (btn.height + m_font->ascent - m_font->descent) / 2;
+                XDrawString(m_display, m_buffer, gc, textX, textY,
+                            btn.label.c_str(), (int)btn.label.length());
+            }
         }
     }
 }
@@ -372,7 +504,8 @@ void Renderer::drawColorSubMenuToBuffer(GC gc) {
         m_font = XLoadQueryFont(m_display, "9x15");
         m_fontLoaded = true;
     }
-    if (m_font) {
+    XFontStruct* sm = getSubmenuFont();
+    if (sm) {
         for (int i = 0; i < n; i++) {
             bool hovered = (i == m_colorSubMenu.hoveredIndex);
             int itemY = y + i * itemH;
@@ -388,10 +521,93 @@ void Renderer::drawColorSubMenuToBuffer(GC gc) {
             XFillRectangle(m_display, m_buffer, gc, x + 4, itemY + 4, 16, itemH - 8);
 
             setGCColor(m_display, gc, 255, 255, 255);
-            XSetFont(m_display, gc, m_font->fid);
-            XDrawString(m_display, m_buffer, gc, x + 24, itemY + itemH / 2 + m_font->ascent / 2,
+            XSetFont(m_display, gc, sm->fid);
+            XDrawString(m_display, m_buffer, gc, x + 24, itemY + itemH / 2 + sm->ascent / 2,
                         m_colorSubMenu.colors[i].first.c_str(),
                         (int)m_colorSubMenu.colors[i].first.length());
+        }
+    }
+}
+
+void Renderer::drawSizeSubMenuToBuffer(GC gc) {
+    if (!m_sizeSubMenu.visible) return;
+
+    int x = m_sizeSubMenu.x;
+    int y = m_sizeSubMenu.y;
+    int itemH = m_sizeSubMenu.itemHeight;
+    int itemW = m_sizeSubMenu.itemWidth;
+    int n = (int)m_sizeSubMenu.sizes.size();
+
+    // White background with a thin gray border — matches the
+    // new white toolbar look.
+    setGCColor(m_display, gc, 255, 255, 255);
+    XFillRectangle(m_display, m_buffer, gc, x, y, itemW, itemH * n);
+
+    setGCColor(m_display, gc, 200, 200, 200);
+    XDrawRectangle(m_display, m_buffer, gc, x, y, itemW, itemH * n);
+
+    XFontStruct* sm = getSubmenuFont();
+    if (sm) {
+        // 10x10 filled black circle (radio marker) at the
+        // left of the row. The text is offset to the right
+        // of the circle so the two don't overlap.
+        const int dotSize = 10;
+        const int dotPad  = 8;
+        const int dotX0   = x + dotPad;             // left edge of circle
+        const int textX0  = dotX0 + dotSize + 8;    // text starts after circle
+
+        for (int i = 0; i < n; i++) {
+            bool hovered  = (i == m_sizeSubMenu.hoveredIndex);
+            bool selected = (m_sizeSubMenu.sizes[i].second == m_fontSize);
+            int itemY = y + i * itemH;
+
+            // Hover row gets a light gray fill. The
+            // selected indicator is drawn *on top* of this
+            // fill, so the dot stays visible.
+            if (hovered) {
+                setGCColor(m_display, gc, 230, 230, 230);
+                XFillRectangle(m_display, m_buffer, gc, x + 1, itemY + 1, itemW - 2, itemH - 2);
+            }
+
+            // Radio button: filled black circle when this
+            // row is the current size, empty white circle
+            // (just an outline) otherwise. XFillArc draws a
+            // pie slice; passing 0..360*64 fills a full
+            // disk. The Y axis is inverted vs normal math
+            // (origin at top), so "center - r" is the top
+            // of the circle in screen coordinates.
+            int dotCy = itemY + itemH / 2;
+            if (selected) {
+                setGCColor(m_display, gc, 0, 0, 0);
+                XFillArc(m_display, m_buffer, gc,
+                         dotX0, dotCy - dotSize / 2,
+                         dotSize, dotSize, 0, 360 * 64);
+            } else {
+                // Empty circle (white inside, black border)
+                // so the rows stay visually consistent and
+                // the selected one is the obvious "active"
+                // option.
+                setGCColor(m_display, gc, 255, 255, 255);
+                XFillArc(m_display, m_buffer, gc,
+                         dotX0, dotCy - dotSize / 2,
+                         dotSize, dotSize, 0, 360 * 64);
+                setGCColor(m_display, gc, 180, 180, 180);
+                XSetLineAttributes(m_display, gc, 1,
+                                   LineSolid, CapButt, JoinMiter);
+                XDrawArc(m_display, m_buffer, gc,
+                         dotX0, dotCy - dotSize / 2,
+                         dotSize, dotSize, 0, 360 * 64);
+            }
+
+            // Label — fixed-size font so the menu doesn't
+            // shift when the user changes the active text
+            // size.
+            setGCColor(m_display, gc, 0, 0, 0);
+            XSetFont(m_display, gc, sm->fid);
+            XDrawString(m_display, m_buffer, gc,
+                        textX0, itemY + itemH / 2 + sm->ascent / 2,
+                        m_sizeSubMenu.sizes[i].first.c_str(),
+                        (int)m_sizeSubMenu.sizes[i].first.length());
         }
     }
 }
@@ -470,80 +686,60 @@ void Renderer::drawEllipse(Drawable d, GC gc, int cx, int cy, int rx, int ry, Dr
 
 void Renderer::drawTextsToBuffer(GC gc, const std::vector<TextAnnotation>& texts) {
     for (const auto& text : texts) {
-        drawTextString(m_buffer, gc, text.x, text.y, text.text, text.color);
+        // Each annotation carries its own size, so the
+        // rendered text never changes when the user toggles
+        // the Size submenu.
+        drawTextString(m_buffer, gc, text.x, text.y, text.text, text.color, text.fontSize);
     }
 }
 
-void Renderer::drawTextString(Drawable d, GC gc, int x, int y, const std::string& text, DrawColor color) {
+void Renderer::drawTextString(Drawable d, GC gc, int x, int y, const std::string& text, DrawColor color, int fontSize) {
     if (text.empty()) return;
 
-    if (!m_fontLoaded) {
-        m_font = XLoadQueryFont(m_display, "9x15");
-        if (!m_font) m_font = XLoadQueryFont(m_display, "fixed");
-        m_fontLoaded = true;
-    }
+    // Each piece of text remembers its own font size, so
+    // changing the Size submenu does not retroactively
+    // resize already-committed text. Look up the matching
+    // font from the cache; fall back to the active font if
+    // the size-specific one could not be loaded.
+    XFontStruct* font = getFontForSize(fontSize);
+    if (!font) font = m_font;
+    if (!font) return;
 
-    if (m_font) {
-        int baselineY = y - 4;
-        setGCColor(m_display, gc, 0, 0, 0);
-        XSetFont(m_display, gc, m_font->fid);
-        XDrawString(m_display, d, gc, x + 1, baselineY + 1, text.c_str(), (int)text.length());
+    // text.y is the *baseline* of the string, not a
+    // bounding-box coordinate. confirmText() computes it
+    // so the committed text lines up exactly with what the
+    // user saw in the input preview. XDrawString takes the
+    // baseline as its y argument, so we just pass y through.
 
-        setGCColor(m_display, gc, color.r, color.g, color.b);
-        XDrawString(m_display, d, gc, x, baselineY, text.c_str(), (int)text.length());
-    }
+    // Subtle drop shadow for legibility on light backgrounds.
+    setGCColor(m_display, gc, 0, 0, 0);
+    XSetFont(m_display, gc, font->fid);
+    XDrawString(m_display, d, gc, x + 1, y + 1,
+                text.c_str(), (int)text.length());
+    setGCColor(m_display, gc, color.r, color.g, color.b);
+    XDrawString(m_display, d, gc, x, y,
+                text.c_str(), (int)text.length());
 }
 
 void Renderer::drawTextInputBoxToBuffer() {
     if (!m_textInput) return;
 
-    // Load a multibyte fontset on first use (or after the size changed).
-    // The pattern includes the current m_fontSize so picking a different
-    // size from the menu actually resizes the input text. We try a
-    // specific XLFD pattern first, then fall back to "*" which lets Xlib
-    // pick a font matching the current locale (so CJK characters committed
-    // by the IME actually render instead of showing up as tofu boxes).
-    if (!m_fontsetLoaded) {
-        char pattern[256];
-        // XLFD field 7 is pixel size. Wildcards everywhere else let the
-        // X server choose a font that supports the current locale.
-        snprintf(pattern, sizeof(pattern),
-                 "-misc-fixed-*-r-normal--*-%d-*-*-*-*-*-*-*",
-                 m_fontSize);
-        char** missing_charsets = nullptr;
-        int num_missing = 0;
-        m_fontset = XCreateFontSet(m_display, pattern,
-                                   &missing_charsets, &num_missing, nullptr);
-        if (!m_fontset) {
-            // Drop the size constraint and let the server pick.
-            m_fontset = XCreateFontSet(m_display, "-*-*-*-*-*-*-*-*-*-*-*-*-*-*",
-                                       &missing_charsets, &num_missing, nullptr);
-        }
-        if (!m_fontset) {
-            m_fontset = XCreateFontSet(m_display, "*",
-                                       &missing_charsets, &num_missing, nullptr);
-        }
-        if (missing_charsets) XFreeStringList(missing_charsets);
-        m_fontsetLoaded = true;
-    }
+    // Make sure the active bitmap font is loaded (set by
+    // setFontSize, which runs on construction and on every
+    // submenu pick). The fontset is still kept around for
+    // CJK IME input — see below.
+    ensureFallbackFont();
 
-    // Also keep the legacy single-byte font loaded so XTextWidth keeps
-    // working for width measurement. XTextWidth on a multibyte string
-    // returns the byte count, not the visual width, so it underestimates
-    // CJK strings — we add a per-byte pad to compensate.
-    if (!m_fontLoaded) {
-        m_font = XLoadQueryFont(m_display, "9x15");
-        if (!m_font) m_font = XLoadQueryFont(m_display, "fixed");
-        m_fontLoaded = true;
-    }
-
-    // Measure the visual width of the current input. XTextWidth is wrong for
-    // multibyte text (it counts bytes, not glyphs), so prefer XmbTextExtents
-    // when the fontset is available. We must use the SAME measurement for
-    // positioning the cursor, otherwise the cursor drifts to ~2x the actual
-    // text end (the previous bug from a per-byte pad on top of XTextWidth).
+    // Width measurement: prefer the fontset so multibyte / CJK
+    // strings report the correct visual width, and fall back to
+    // the bitmap font for ASCII. We must measure the SAME way
+    // we render below, otherwise the cursor drifts.
     int textWidth = 0;
-    if (m_fontset) {
+    bool hasNonAscii = false;
+    for (unsigned char c : m_currentInput) {
+        if (c >= 0x80) { hasNonAscii = true; break; }
+    }
+    if (hasNonAscii && m_fontset) {
         XRectangle ink, logical;
         XmbTextExtents(m_fontset, m_currentInput.c_str(),
                        (int)m_currentInput.length(), &ink, &logical);
@@ -551,10 +747,21 @@ void Renderer::drawTextInputBoxToBuffer() {
     } else if (m_font) {
         textWidth = XTextWidth(m_font, m_currentInput.c_str(), (int)m_currentInput.length());
     }
-    // Small fixed padding so the cursor / box border don't touch the glyphs.
+
     int boxWidth = textWidth + 20;
+
+    // Box height follows the active font's metrics. Use the
+    // fontset's logical extent for CJK (it's reliable and
+    // size-aware) and fall back to the bitmap font's
+    // ascent/descent.
     int boxHeight = 24;
-    if (m_font) boxHeight = m_font->ascent + m_font->descent + 8;
+    if (m_fontset) {
+        XRectangle ink, logical;
+        XmbTextExtents(m_fontset, "Mg", 2, &ink, &logical);
+        boxHeight = logical.height + 8;
+    } else if (m_font) {
+        boxHeight = m_font->ascent + m_font->descent + 8;
+    }
 
     int boxY = m_textInputY - boxHeight / 2;
 
@@ -568,23 +775,22 @@ void Renderer::drawTextInputBoxToBuffer() {
     XDrawRectangle(m_display, m_buffer, inputGC, m_textInputX, boxY, boxWidth, boxHeight);
 
     if (!m_currentInput.empty()) {
-        // Use the active color from the Color menu. We MUST go through
-        // setGCColor / XAllocColor — direct XSetForeground with a manual
-        // bit shift gives the wrong pixel because X's default visual
-        // is not 24-bit truecolor; XAllocColor maps the requested RGB
-        // into the colormap's actual pixel value.
-        if (m_fontset) {
-            // XmbDrawString renders multibyte strings using the fontset —
-            // this is what makes Chinese characters appear correctly.
-            setGCColor(m_display, inputGC, m_currentColor.r, m_currentColor.g, m_currentColor.b);
+        // Render using the fontset for CJK (multibyte), the
+        // size-aware bitmap font for Latin. This matches the
+        // size the user picked: small uses 9x15, medium uses
+        // 12x24, big uses 16x32.
+        setGCColor(m_display, inputGC, m_currentColor.r, m_currentColor.g, m_currentColor.b);
+        if (hasNonAscii && m_fontset) {
             XmbDrawString(m_display, m_buffer, m_fontset, inputGC,
                           m_textInputX + 4, boxY + boxHeight - 4,
                           m_currentInput.c_str(), (int)m_currentInput.length());
         } else if (m_font) {
-            // Last-resort ASCII fallback.
-            setGCColor(m_display, inputGC, m_currentColor.r, m_currentColor.g, m_currentColor.b);
             XSetFont(m_display, inputGC, m_font->fid);
-            XDrawString(m_display, m_buffer, inputGC, m_textInputX + 4, boxY + boxHeight - 4,
+            // Baseline near the bottom of the box, with 4px
+            // above for descenders and the box border.
+            int textY = boxY + boxHeight - 4 - m_font->descent;
+            XDrawString(m_display, m_buffer, inputGC,
+                        m_textInputX + 4, textY,
                         m_currentInput.c_str(), (int)m_currentInput.length());
         }
 
@@ -751,12 +957,25 @@ void Renderer::confirmText() {
         return;
     }
 
+    // Compute the same box metrics the input box preview
+    // used, so the committed text baseline lines up exactly
+    // with what the user saw while typing. Otherwise the
+    // committed text would appear noticeably lower than the
+    // preview (the previous bug: text.y was set to the box
+    // bottom and drawTextString then added (ascent-descent)/2
+    // on top, pushing the baseline 10-20px below the input).
     int boxHeight = 24;
-    if (m_font) boxHeight = m_font->ascent + m_font->descent + 8;
+    int descent = 0;
+    if (m_font) {
+        boxHeight = m_font->ascent + m_font->descent + 8;
+        descent = m_font->descent;
+    }
+    // baselineY is what drawTextString now uses directly.
+    int baselineY = m_textInputY + boxHeight / 2 - 4 - descent;
 
     TextAnnotation text;
     text.x = m_textInputX;
-    text.y = m_textInputY + boxHeight / 2;
+    text.y = baselineY;
     text.text = m_currentInput;
     text.color = m_currentColor;
     text.fontSize = m_fontSize;

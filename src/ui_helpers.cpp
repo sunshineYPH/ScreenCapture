@@ -45,20 +45,28 @@ void calcMenuButtons(int selX, int selY, int selW, int selH, int screenH,
                      std::vector<MenuButton>& buttons) {
     buttons.clear();
     const int btnSpacing = 4;
-    const int btnHeight = 26;
-    const int btnWidth = 50;
-    const int barPadV = 4;
-    const int charWidth = 12;  // Chinese chars need more width
+    // Larger buttons (was 42x36) — the 32-px icons need more
+    // room to breathe on a white background where the contrast
+    // is higher than on dark. Aspect is a bit wider than tall
+    // so the bar looks like a horizontal toolbar.
+    const int btnHeight = 48;
+    const int btnWidth  = 54;
+    // Thin vertical padding (was 6) — keep this in sync with
+    // Renderer::drawMenuBarToBuffer's barPadV. The two values
+    // must match exactly, or the buttons will sit outside
+    // (or be clipped by) the bar background.
+    const int barPadV   = 0;
+    const int edgeMargin = 10;  // keep this much space from the
+                                // selection rectangle's edge
 
-    int totalBtnWidth = 0;
-    for (int i = 0; i < NUM_BUTTONS; i++) {
-        int w = btnWidth + static_cast<int>(strlen(MENU_LABELS[i])) * charWidth;
-        totalBtnWidth += w + btnSpacing;
-    }
-
+    int totalBtnWidth = NUM_BUTTONS * btnWidth + (NUM_BUTTONS - 1) * btnSpacing;
     int barHeight = btnHeight + barPadV * 2;
 
-    int menuX = selX + (selW - totalBtnWidth) / 2;
+    // Right-align the bar inside the selection rectangle. The
+    // menu sits just below the bottom edge of the selection with
+    // a 20-px gap, and a 10-px right margin keeps it from
+    // touching the rectangle's right edge.
+    int menuX = selX + selW - totalBtnWidth - edgeMargin;
     int menuY = selY + selH + 20;
 
     if (menuY + barHeight > screenH - 10) {
@@ -71,7 +79,7 @@ void calcMenuButtons(int selX, int selY, int selW, int selH, int screenH,
     for (int i = 0; i < NUM_BUTTONS; i++) {
         MenuButton btn;
         btn.label = MENU_LABELS[i];
-        btn.width = btnWidth + static_cast<int>(strlen(MENU_LABELS[i])) * charWidth;
+        btn.width = btnWidth;
         btn.height = btnHeight;
         btn.x = btnX;
         btn.y = menuY;
@@ -102,6 +110,18 @@ int getColorSubMenuIndex(const ColorSubMenu& sub, int mx, int my) {
 
     int idx = (my - sub.y) / sub.itemHeight;
     if (idx >= 0 && idx < (int)sub.colors.size()) {
+        return idx;
+    }
+    return -1;
+}
+
+int getSizeSubMenuIndex(const SizeSubMenu& sub, int mx, int my) {
+    if (!sub.visible) return -1;
+    if (mx < sub.x || mx > sub.x + sub.itemWidth) return -1;
+    if (my < sub.y || my > sub.y + sub.itemHeight * (int)sub.sizes.size()) return -1;
+
+    int idx = (my - sub.y) / sub.itemHeight;
+    if (idx >= 0 && idx < (int)sub.sizes.size()) {
         return idx;
     }
     return -1;

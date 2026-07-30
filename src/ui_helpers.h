@@ -33,4 +33,8 @@ int getButtonAt(const std::vector<MenuButton>& buttons, int mx, int my);
 // or -1 if the submenu is hidden or the mouse is outside it.
 int getColorSubMenuIndex(const ColorSubMenu& sub, int mx, int my);
 
+// Returns the index of the size row under (mx, my) in the size submenu,
+// or -1 if the submenu is hidden or the mouse is outside it.
+int getSizeSubMenuIndex(const SizeSubMenu& sub, int mx, int my);
+
 #endif // SCREEN_CAPTURE_UI_HELPERS_H

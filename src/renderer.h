@@ -3,6 +3,7 @@
 
 #include "capture.h"
 #include <X11/Xlib.h>
+#include <unordered_map>
 #include <vector>
 #include <string>
 
@@ -55,6 +56,21 @@ struct ColorSubMenu {
     std::vector<std::pair<std::string, DrawColor>> colors;
 };
 
+// Sub-menu attached to the "Size" toolbar button. The user
+// picks one of three preset font sizes (small/medium/large)
+// for subsequent text annotations. Mirrors ColorSubMenu in
+// shape so the rendering and hit-test code stay symmetric.
+struct SizeSubMenu {
+    bool visible;
+    int x, y;
+    int itemWidth;
+    int itemHeight;
+    int hoveredIndex;
+    // The size in points (or whatever units the renderer
+    // uses) paired with a display label.
+    std::vector<std::pair<std::string, int>> sizes;
+};
+
 struct TextAnnotation {
     int x, y;
     std::string text;
@@ -104,6 +120,11 @@ public:
     void addEllipse(const Ellipse& ellipse);
     void clearAnnotations();
 
+    // Lazily load the single-byte 9x15 font used as a text fallback
+    // when a particular button's icon failed to load. Safe to call
+    // repeatedly; only the first call hits X.
+    void ensureFallbackFont();
+
     void undo();
     void redo();
     bool canUndo() const { return m_historyIndex > 0; }
@@ -113,15 +134,30 @@ public:
     DrawColor getDrawColor() const { return m_currentColor; }
     void setFontSize(int size) {
         m_fontSize = size;
-        // Invalidate the cached fontset so the next drawTextInputBoxToBuffer()
-        // call rebuilds it at the new size. The fontset is created once per
-        // size — there is no way to resize an existing XFontSet in place.
-        if (m_fontset) {
-            XFreeFontSet(m_display, m_fontset);
-            m_fontset = nullptr;
-        }
-        m_fontsetLoaded = false;
+        // Set the active font by looking it up in (and
+        // populating) the size cache. Subsequent setFontSize
+        // calls with the same size are a no-op (the cache hit
+        // is free). m_font is what the input box and
+        // active-tool indicators read.
+        m_font = getFontForSize(size);
     }
+
+    // Look up the bitmap font for a given pixel size,
+    // loading it on first request and caching for reuse.
+    // We map the requested size to a specific X core bitmap
+    // font that exists on this system (see comments in
+    // setFontSize). Once loaded, a font is reused for every
+    // text annotation of that size — so flipping the Size
+    // submenu back and forth is free, and committed text
+    // drawn with the old size still renders with its
+    // original font after a size change.
+    XFontStruct* getFontForSize(int size);
+
+    // Fixed submenu font (loaded once, used for the
+    // "small/medium/big" labels and the color name labels in
+    // their respective popups). Independent of m_font.
+    XFontStruct* getSubmenuFont();
+
     int getFontSize() const { return m_fontSize; }
 
     bool isTextInput() const { return m_textInput; }
@@ -159,6 +195,12 @@ public:
     int getColorSubMenuHover() const { return m_colorSubMenu.hoveredIndex; }
     void updateColorSubMenu(int baseX, int baseY);
 
+    SizeSubMenu getSizeSubMenu() const { return m_sizeSubMenu; }
+    void setSizeSubMenuVisible(bool visible) { m_sizeSubMenu.visible = visible; }
+    void setSizeSubMenuHover(int index) { m_sizeSubMenu.hoveredIndex = index; }
+    int getSizeSubMenuHover() const { return m_sizeSubMenu.hoveredIndex; }
+    void updateSizeSubMenu(int baseX, int baseY);
+
 enum class DrawState {
     IDLE,
     DRAWING
@@ -172,8 +214,25 @@ private:
 
     GC m_bufferGC;
     GC m_winGC;
-    XFontStruct* m_font;        // single-byte font, kept for legacy callers
+    // m_font is the *active* font (whatever the user just
+    // picked from the Size submenu). It's used for the input
+    // box and the size submenu active row. For committed
+    // text and submenu labels, each piece of text remembers
+    // its own size and we look up the matching font from
+    // m_fontsBySize below — so changing the size doesn't
+    // retroactively resize old text.
+    XFontStruct* m_font;
     bool m_fontLoaded;
+    // Cache of fonts keyed by pixel size. Each committed
+    // text annotation carries its own fontSize, so when we
+    // re-draw the scene we look up the font for that exact
+    // size here. We never mutate m_font when reading from
+    // this cache.
+    std::unordered_map<int, XFontStruct*> m_fontsBySize;
+    // Fixed font used for submenu labels ("small/medium/big",
+    // color names). Intentionally NOT affected by the user's
+    // size choice — the submenu is metadata, not content.
+    XFontStruct* m_submenuFont;
     XFontSet m_fontset;         // multibyte fontset for IME/CJK text input
     bool m_fontsetLoaded;
 
@@ -197,6 +256,7 @@ private:
     DrawState m_drawState;
     int m_tempX1, m_tempY1, m_tempX2, m_tempY2;
     ColorSubMenu m_colorSubMenu;
+    SizeSubMenu   m_sizeSubMenu;
 
     std::vector<HistoryState> m_history;
     int m_historyIndex;
@@ -206,6 +266,7 @@ private:
     void drawRGBPanelToBuffer(GC gc);
     void drawMenuBarToBuffer(GC gc);
     void drawColorSubMenuToBuffer(GC gc);
+    void drawSizeSubMenuToBuffer(GC gc);
     void drawArrowsToBuffer(GC gc, const std::vector<Arrow>& arrows);
     void drawRectanglesToBuffer(GC gc, const std::vector<Rectangle>& rects);
     void drawEllipsesToBuffer(GC gc, const std::vector<Ellipse>& ellipses);
@@ -215,7 +276,7 @@ private:
     void drawArrowLine(Drawable d, GC gc, int x1, int y1, int x2, int y2, DrawColor color);
     void drawRect(Drawable d, GC gc, int x, int y, int w, int h, DrawColor color);
     void drawEllipse(Drawable d, GC gc, int cx, int cy, int rx, int ry, DrawColor color);
-    void drawTextString(Drawable d, GC gc, int x, int y, const std::string& text, DrawColor color);
+    void drawTextString(Drawable d, GC gc, int x, int y, const std::string& text, DrawColor color, int fontSize);
     void saveHistory();
 
     Pixmap m_buffer;

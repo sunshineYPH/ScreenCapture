@@ -1,6 +1,7 @@
 #include "capture.h"
 #include "clipboard.h"
 #include "globals.h"
+#include "button_icons.h"
 #include "pin_window.h"
 #include "renderer.h"
 #include "ui_helpers.h"
@@ -125,6 +126,17 @@ int main(int argc, char* argv[]) {
     Renderer* renderer = new Renderer(display, overlay, capture);
     renderer->initDoubleBuffer();
 
+    // Load the menu-button icon PNGs from ./assets/ (or fallback
+    // search paths inside button_icons::init). Loaded once up front
+    // and cached as 24-bit server-side Pixmaps so XCopyArea is the
+    // only per-frame work. If the assets directory is missing or any
+    // icon is broken, the menu bar falls back to text labels — see
+    // Renderer::drawMenuBarToBuffer.
+    // The assetsDir argument is no longer used by button_icons;
+    // it now resolves paths from the binary's own directory.
+    // The arg is kept in the API for source compatibility.
+    button_icons::init(display, DefaultScreen(display), "", 32);
+
     AppState state = AppState::DRAWING_SELECTION;
     int selStartX = 0, selStartY = 0;
     int selX = 0, selY = 0, selW = 0, selH = 0;
@@ -133,9 +145,6 @@ int main(int argc, char* argv[]) {
     bool selectionValid = false;
     std::vector<MenuButton> menuButtons;
 
-    int fontSizeIndex = 1;
-    const int fontSizes[] = {12, 16, 20, 24, 32, 40};
-    bool shiftPressed = false;
     int activeToolButton = -1; // Track which tool button is active (-1 = none)
 
     // Resize state
@@ -267,7 +276,14 @@ int main(int argc, char* argv[]) {
 
                         needRender = true;
                     } else if (state == AppState::TOOL_MODE && renderer->isDrawingShape()) {
-                        renderer->updateShape(ev.xmotion.x, ev.xmotion.y, shiftPressed);
+                        // Read Shift directly from the event's state field. We used
+                        // to track it via KeyPress/KeyRelease, but fcitx/ibus swallow
+                        // the Shift KeyRelease (to toggle CN/EN) so the tracked flag
+                        // would get stuck at true and every subsequent shape was
+                        // forced to a square/circle. The event's state field is
+                        // always accurate at the moment of the event.
+                        bool shift = (ev.xmotion.state & ShiftMask) != 0;
+                        renderer->updateShape(ev.xmotion.x, ev.xmotion.y, shift);
                         needRender = true;
                     } else if (state == AppState::TOOL_MODE && renderer->isDrawingShape() == false &&
                                (renderer->getToolMode() == ToolMode::ARROW)) {
@@ -340,6 +356,17 @@ int main(int argc, char* argv[]) {
                             }
                         }
 
+                        // Check size submenu — same hover-tracking
+                        // pattern as the color submenu.
+                        SizeSubMenu sizeSub = renderer->getSizeSubMenu();
+                        if (sizeSub.visible) {
+                            int sizeIdx = getSizeSubMenuIndex(sizeSub, ev.xmotion.x, ev.xmotion.y);
+                            if (sizeIdx != renderer->getSizeSubMenuHover()) {
+                                renderer->setSizeSubMenuHover(sizeIdx);
+                                changed = true;
+                            }
+                        }
+
                         if (changed) needRender = true;
                     }
                     break;
@@ -361,6 +388,7 @@ int main(int argc, char* argv[]) {
                             menuButtons.clear();
                             renderer->setMenuButtons(menuButtons);
                             renderer->setColorSubMenuVisible(false);
+                            renderer->setSizeSubMenuVisible(false);
                             needRender = true;
                         } else if (state == AppState::SELECTION_DONE || state == AppState::TOOL_MODE) {
                             // Check if clicking on border for resize
@@ -389,6 +417,23 @@ int main(int argc, char* argv[]) {
                                     break;
                                 } else {
                                     renderer->setColorSubMenuVisible(false);
+                                }
+                            }
+
+                            // Check size submenu first (mirrors the
+                            // color-submenu pattern above). Picking a
+                            // size sets the font size used by the Text
+                            // tool and closes the submenu.
+                            SizeSubMenu sizeSub = renderer->getSizeSubMenu();
+                            if (sizeSub.visible) {
+                                int sizeIdx = getSizeSubMenuIndex(sizeSub, mx, my);
+                                if (sizeIdx >= 0) {
+                                    renderer->setFontSize(sizeSub.sizes[sizeIdx].second);
+                                    renderer->setSizeSubMenuVisible(false);
+                                    needRender = true;
+                                    break;
+                                } else {
+                                    renderer->setSizeSubMenuVisible(false);
                                 }
                             }
 
@@ -445,8 +490,18 @@ int main(int argc, char* argv[]) {
                                     state = AppState::TOOL_MODE;
                                     renderer->setToolMode(ToolMode::TEXT);
                                 } else if (clickedLabel == "Size") {
-                                    fontSizeIndex = (fontSizeIndex + 1) % 6;
-                                    renderer->setFontSize(fontSizes[fontSizeIndex]);
+                                    // Toggle the size submenu below the
+                                    // Size button. If already visible, hide
+                                    // it (so clicking the same button again
+                                    // closes the submenu).
+                                    MenuButton& sizeBtn = menuButtons[btnIdx];
+                                    renderer->updateSizeSubMenu(sizeBtn.x, sizeBtn.y + sizeBtn.height + 4);
+                                    if (renderer->getSizeSubMenu().visible) {
+                                        renderer->setSizeSubMenuVisible(false);
+                                    } else {
+                                        renderer->setSizeSubMenuVisible(true);
+                                        renderer->setSizeSubMenuHover(-1);
+                                    }
                                 } else if (clickedLabel == "Color") {
                                     // Show color subm+enu below the button
                                     MenuButton& colorBtn = menuButtons[btnIdx];
@@ -541,7 +596,8 @@ int main(int argc, char* argv[]) {
                             if (mode == ToolMode::ARROW) {
                                 renderer->finishArrow();
                             } else if (mode == ToolMode::RECT || mode == ToolMode::ELLIPSE) {
-                                renderer->finishShape(shiftPressed);
+                                bool shift = (ev.xbutton.state & ShiftMask) != 0;
+                                renderer->finishShape(shift);
                             }
                             needRender = true;
                         }
@@ -551,11 +607,6 @@ int main(int argc, char* argv[]) {
                 case KeyPress: {
                     KeySym key = XLookupKeysym(&ev.xkey, 0);
                     bool ctrlPressed = (ev.xkey.state & ControlMask) != 0;
-
-                    // Track Shift key
-                    if (key == XK_Shift_L || key == XK_Shift_R) {
-                        shiftPressed = true;
-                    }
 
                     if (key == XK_Escape) {
                         if (renderer->isTextInput()) {
@@ -582,7 +633,8 @@ int main(int argc, char* argv[]) {
                     // Arrow keys: nudge the selection rectangle. 1px normally,
                     // 10px when Shift is held. Clamped to screen bounds.
                     if (state == AppState::SELECTION_DONE) {
-                        int step = shiftPressed ? 10 : 1;
+                        bool shift = (ev.xkey.state & ShiftMask) != 0;
+                        int step = shift ? 10 : 1;
                         int newX = selX, newY = selY;
                         if (key == XK_Left)       newX -= step;
                         else if (key == XK_Right) newX += step;
@@ -645,13 +697,6 @@ int main(int argc, char* argv[]) {
                     break;
                 }
 
-                case KeyRelease: {
-                    KeySym key = XLookupKeysym(&ev.xkey, 0);
-                    if (key == XK_Shift_L || key == XK_Shift_R) {
-                        shiftPressed = false;
-                    }
-                    break;
-                }
             }
 
             // Process remaining pending events without blocking
@@ -745,7 +790,8 @@ int main(int argc, char* argv[]) {
                             selH = std::abs(currentY - selStartY);
                             needRender = true;
                         } else if (state == AppState::TOOL_MODE && renderer->isDrawingShape()) {
-                            renderer->updateShape(ev.xmotion.x, ev.xmotion.y, shiftPressed);
+                            bool shift = (ev.xmotion.state & ShiftMask) != 0;
+                            renderer->updateShape(ev.xmotion.x, ev.xmotion.y, shift);
                             needRender = true;
                         } else if (state == AppState::TOOL_MODE && !renderer->isDrawingShape() &&
                                    (renderer->getToolMode() == ToolMode::ARROW)) {
@@ -800,6 +846,14 @@ int main(int argc, char* argv[]) {
                                     changed2 = true;
                                 }
                             }
+                            SizeSubMenu sizeSub2 = renderer->getSizeSubMenu();
+                            if (sizeSub2.visible) {
+                                int sizeIdx = getSizeSubMenuIndex(sizeSub2, ev.xmotion.x, ev.xmotion.y);
+                                if (sizeIdx != renderer->getSizeSubMenuHover()) {
+                                    renderer->setSizeSubMenuHover(sizeIdx);
+                                    changed2 = true;
+                                }
+                            }
                             if (changed2) needRender = true;
                         }
                         break;
@@ -816,6 +870,7 @@ int main(int argc, char* argv[]) {
                                 menuButtons.clear();
                                 renderer->setMenuButtons(menuButtons);
                                 renderer->setColorSubMenuVisible(false);
+                                renderer->setSizeSubMenuVisible(false);
                                 needRender = true;
                             } else if (state == AppState::SELECTION_DONE || state == AppState::TOOL_MODE) {
                                 ResizeEdge edge2 = getResizeEdge(mx2, my2, selX, selY, selW, selH);
@@ -837,6 +892,16 @@ int main(int argc, char* argv[]) {
                                         needRender = true;
                                         break;
                                     } else { renderer->setColorSubMenuVisible(false); }
+                                }
+                                SizeSubMenu sizeSub2 = renderer->getSizeSubMenu();
+                                if (sizeSub2.visible) {
+                                    int sizeIdx = getSizeSubMenuIndex(sizeSub2, mx2, my2);
+                                    if (sizeIdx >= 0) {
+                                        renderer->setFontSize(sizeSub2.sizes[sizeIdx].second);
+                                        renderer->setSizeSubMenuVisible(false);
+                                        needRender = true;
+                                        break;
+                                    } else { renderer->setSizeSubMenuVisible(false); }
                                 }
                                 int btnIdx = getButtonAt(menuButtons, mx2, my2);
                                 if (btnIdx >= 0) {
@@ -876,7 +941,17 @@ int main(int argc, char* argv[]) {
                                     } else if (clickedLabel == "Rect") { state = AppState::TOOL_MODE; renderer->setToolMode(ToolMode::RECT);
                                     } else if (clickedLabel == "Ellipse") { state = AppState::TOOL_MODE; renderer->setToolMode(ToolMode::ELLIPSE);
                                     } else if (clickedLabel == "Text") { state = AppState::TOOL_MODE; renderer->setToolMode(ToolMode::TEXT);
-                                    } else if (clickedLabel == "Size") { fontSizeIndex = (fontSizeIndex + 1) % 6; renderer->setFontSize(fontSizes[fontSizeIndex]);
+                                    } else if (clickedLabel == "Size") {
+                                        // Toggle the size submenu (mirrors the
+                                        // single-line code path above).
+                                        MenuButton& sizeBtn = menuButtons[btnIdx];
+                                        renderer->updateSizeSubMenu(sizeBtn.x, sizeBtn.y + sizeBtn.height + 4);
+                                        if (renderer->getSizeSubMenu().visible) {
+                                            renderer->setSizeSubMenuVisible(false);
+                                        } else {
+                                            renderer->setSizeSubMenuVisible(true);
+                                            renderer->setSizeSubMenuHover(-1);
+                                        }
                                     } else if (clickedLabel == "Color") {
                                         MenuButton& colorBtn = menuButtons[btnIdx];
                                         renderer->updateColorSubMenu(colorBtn.x, colorBtn.y + colorBtn.height + 4);
@@ -944,7 +1019,10 @@ int main(int argc, char* argv[]) {
                             } else if (state == AppState::TOOL_MODE) {
                                 ToolMode mode = renderer->getToolMode();
                                 if (mode == ToolMode::ARROW) { renderer->finishArrow();
-                                } else if (mode == ToolMode::RECT || mode == ToolMode::ELLIPSE) { renderer->finishShape(shiftPressed); }
+                                } else if (mode == ToolMode::RECT || mode == ToolMode::ELLIPSE) {
+                                    bool shift = (ev.xbutton.state & ShiftMask) != 0;
+                                    renderer->finishShape(shift);
+                                }
                                 needRender = true;
                             }
                         }
@@ -953,7 +1031,6 @@ int main(int argc, char* argv[]) {
                     case KeyPress: {
                         KeySym key = XLookupKeysym(&ev.xkey, 0);
                         bool ctrlPressed = (ev.xkey.state & ControlMask) != 0;
-                        if (key == XK_Shift_L || key == XK_Shift_R) shiftPressed = true;
                         if (key == XK_Escape) {
                             if (renderer->isTextInput()) { renderer->cancelText(); needRender = true; }
                             else { g_running = false; }
@@ -963,7 +1040,8 @@ int main(int argc, char* argv[]) {
                         if (ctrlPressed && key == XK_y) { renderer->redo(); needRender = true; break; }
                         // Arrow keys: same nudge behavior as the main switch.
                         if (state == AppState::SELECTION_DONE) {
-                            int step = shiftPressed ? 10 : 1;
+                            bool shift = (ev.xkey.state & ShiftMask) != 0;
+                            int step = shift ? 10 : 1;
                             int newX = selX, newY = selY;
                             if (key == XK_Left)       newX -= step;
                             else if (key == XK_Right) newX += step;
@@ -1008,11 +1086,6 @@ int main(int argc, char* argv[]) {
                         break;
                     }
 
-                    case KeyRelease: {
-                        KeySym key = XLookupKeysym(&ev.xkey, 0);
-                        if (key == XK_Shift_L || key == XK_Shift_R) shiftPressed = false;
-                        break;
-                    }
                 }
             }
 
@@ -1161,6 +1234,10 @@ int main(int argc, char* argv[]) {
         XCloseIM(g_im);
         g_im = nullptr;
     }
+
+    // Release cached menu-icon Pixmaps BEFORE XCloseDisplay, since
+    // cleanup needs a live Display*.
+    button_icons::cleanup();
 
     XCloseDisplay(display);
 
